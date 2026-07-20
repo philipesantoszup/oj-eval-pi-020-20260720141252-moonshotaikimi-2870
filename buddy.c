@@ -4,215 +4,171 @@
 #define PAGE_SIZE 4096
 #define MAX_RANK 16
 #define MIN_RANK 1
-#define MAX_PAGES (200000)
+#define MAX_TRACK (128 * 1024)
 
 static struct block {
-    struct block *next;
-    struct block *prev;
-} *free_lists[MAX_RANK + 1];
+    struct block *next, *prev;
+} *flist[MAX_RANK + 1];
 
-static void *mem_start = NULL;
-static void *mem_end = NULL;
-static int num_pages = 0;
-
-/* Tracking */
-static unsigned char ranks_arr[MAX_PAGES];
-static unsigned char alloc_arr[MAX_PAGES];
+static void *mstart = NULL;
+static int npages = 0;
+static unsigned char brank[MAX_TRACK];
+static unsigned char balloc[MAX_TRACK];
 
 static inline int pgidx(void *p) {
-    return (int)(((size_t)p - (size_t)mem_start) / PAGE_SIZE);
+    return (int)(((size_t)p - (size_t)mstart) / PAGE_SIZE);
 }
 
-static inline void *buddyof(void *addr, int rank) {
-    size_t sz = (size_t)PAGE_SIZE << (rank - 1);
-    size_t off = (size_t)addr - (size_t)mem_start;
-    return (void *)((size_t)mem_start + (off ^ sz));
+static inline void *buddy(void *a, int r) {
+    size_t sz = (size_t)PAGE_SIZE << (r - 1);
+    size_t off = (size_t)a - (size_t)mstart;
+    return (void *)((size_t)mstart + (off ^ sz));
 }
 
-static inline int aligned(void *addr, int rank) {
-    size_t sz = (size_t)PAGE_SIZE << (rank - 1);
-    return (((size_t)addr - (size_t)mem_start) & (sz - 1)) == 0;
+static inline int algn(void *a, int r) {
+    size_t sz = (size_t)PAGE_SIZE << (r - 1);
+    return (((size_t)a - (size_t)mstart) & (sz - 1)) == 0;
 }
 
-static inline int valid_rank(int r) {
-    return r >= MIN_RANK && r <= MAX_RANK;
-}
+static inline int vr(int r) { return r >= MIN_RANK && r <= MAX_RANK; }
 
-static inline int valid_addr(void *p) {
+static inline int va(void *p) {
     if (!p) return 0;
-    if (p < mem_start || p >= mem_end) return 0;
-    return (((size_t)p - (size_t)mem_start) & (PAGE_SIZE - 1)) == 0;
+    int idx = pgidx(p);
+    return idx >= 0 && idx < npages;
 }
 
-static void lst_init(struct block *b) {
-    b->next = b->prev = b;
-}
+static void lst_i(struct block *b) { b->next = b->prev = b; }
 
-static void lst_add(struct block *b, int rank) {
-    if (!free_lists[rank]) {
-        lst_init(b);
-        free_lists[rank] = b;
-    } else {
-        struct block *h = free_lists[rank];
-        b->next = h;
-        b->prev = h->prev;
-        h->prev->next = b;
-        h->prev = b;
+static void lst_a(struct block *b, int r) {
+    if (!flist[r]) { lst_i(b); flist[r] = b; }
+    else {
+        struct block *h = flist[r];
+        b->next = h; b->prev = h->prev;
+        h->prev->next = b; h->prev = b;
     }
 }
 
-static void lst_rem(struct block *b, int rank) {
-    if (b->next == b) {
-        free_lists[rank] = 0;
-    } else {
-        b->prev->next = b->next;
-        b->next->prev = b->prev;
-        if (free_lists[rank] == b) free_lists[rank] = b->next;
+static void lst_r(struct block *b, int r) {
+    if (b->next == b) flist[r] = NULL;
+    else { b->prev->next = b->next; b->next->prev = b->prev;
+        if (flist[r] == b) flist[r] = b->next;
     }
 }
 
-static int get_rank(int idx) {
-    while (idx > 0 && !ranks_arr[idx]) idx--;
-    return ranks_arr[idx];
+static int getr(int i) {
+    while (i > 0 && !brank[i]) i--;
+    return brank[i];
 }
 
-static void coal(void *addr, int rank) {
-    while (rank < MAX_RANK) {
-        void *bud = buddyof(addr, rank);
-        if (!valid_addr(bud)) break;
+static void coal(void *a, int r) {
+    while (r < MAX_RANK) {
+        void *b = buddy(a, r);
+        if (!va(b)) break;
+        int bi = pgidx(b), ai = pgidx(a);
+        if (balloc[bi]) break;
+        if (getr(bi) != r) break;
+        void *p = (a < b) ? a : b;
+        if (!algn(p, r+1)) break;
         
-        int aidx = pgidx(addr);
-        int bidx = pgidx(bud);
-        if (bidx < 0 || bidx >= num_pages) break;
+        lst_r((struct block *)b, r);
+        lst_r((struct block *)a, r);
+        lst_a((struct block *)p, r+1);
         
-        if (alloc_arr[bidx]) break;
-        if (get_rank(bidx) != rank) break;
+        int pi = pgidx(p);
+        brank[pi] = r+1; balloc[pi] = 0;
+        int n = 1 << (r+1);
+        if (pi + n > npages) n = npages - pi;
+        for (int i = 1; i < n && pi + i < npages; i++) brank[pi+i] = 0;
         
-        void *par = (addr < bud) ? addr : bud;
-        if (!aligned(par, rank + 1)) break;
-        
-        lst_rem((struct block *)bud, rank);
-        lst_rem((struct block *)addr, rank);
-        lst_add((struct block *)par, rank + 1);
-        
-        int pidx = pgidx(par);
-        ranks_arr[pidx] = rank + 1;
-        alloc_arr[pidx] = 0;
-        
-        int n = 1 << rank;
-        int lim = pidx + n + n;
-        if (lim > num_pages) lim = num_pages;
-        for (int i = pidx + 1; i < lim; i++) ranks_arr[i] = 0;
-        
-        addr = par;
-        rank++;
+        a = p; r++;
     }
 }
 
-static void split(int rank) {
-    if (rank <= MIN_RANK || !free_lists[rank]) return;
-    struct block *b = free_lists[rank];
-    void *addr = (void *)b;
-    lst_rem(b, rank);
+static void spl(int r) {
+    if (r <= MIN_RANK || !flist[r]) return;
+    struct block *bk = flist[r];
+    void *ad = (void *)bk;
+    lst_r(bk, r);
     
-    size_t ss = (size_t)PAGE_SIZE << (rank - 2);
-    void *a1 = addr;
-    void *a2 = (void *)((size_t)addr + ss);
-    
-    lst_add((struct block *)a1, rank - 1);
-    lst_add((struct block *)a2, rank - 1);
+    size_t ss = (size_t)PAGE_SIZE << (r-2);
+    void *a1 = ad, *a2 = (void *)((size_t)ad + ss);
+    lst_a((struct block *)a1, r-1);
+    lst_a((struct block *)a2, r-1);
     
     int i1 = pgidx(a1), i2 = pgidx(a2);
-    ranks_arr[i1] = ranks_arr[i2] = rank - 1;
-    alloc_arr[i1] = alloc_arr[i2] = 0;
+    brank[i1] = brank[i2] = r-1;
+    balloc[i1] = balloc[i2] = 0;
 }
 
-int init_page(void *p, int pgcount) {
-    if (!p || pgcount <= 0 || pgcount > MAX_PAGES) return -EINVAL;
+int init_page(void *p, int pc) {
+    if (!p || pc <= 0 || pc > MAX_TRACK) return -EINVAL;
+    mstart = p;
+    npages = pc;
     
-    mem_start = p;
-    num_pages = pgcount;
-    mem_end = (void *)((size_t)p + (size_t)pgcount * PAGE_SIZE);
-    
-    for (int i = 0; i < pgcount; i++) {
-        ranks_arr[i] = alloc_arr[i] = 0;
-    }
-    for (int i = 0; i <= MAX_RANK; i++) free_lists[i] = 0;
+    for (int i = 0; i < pc; i++) { brank[i] = 0; balloc[i] = 0; }
+    for (int i = 0; i <= MAX_RANK; i++) flist[i] = NULL;
     
     void *cur = p;
     int off = 0;
-    while (off < pgcount) {
-        int rem = pgcount - off;
-        int rank = MAX_RANK;
-        while (rank > MIN_RANK) {
-            int need = 1 << (rank - 1);
-            if (need <= rem && aligned(cur, rank)) break;
-            rank--;
+    while (off < pc) {
+        int rem = pc - off;
+        int r = MAX_RANK;
+        while (r > MIN_RANK) {
+            int need = 1 << (r-1);
+            if (need <= rem && algn(cur, r)) break;
+            r--;
         }
-        int npg = 1 << (rank - 1);
-        lst_add((struct block *)cur, rank);
-        ranks_arr[off] = rank;
-        cur = (void *)((size_t)cur + (size_t)npg * PAGE_SIZE);
-        off += npg;
+        int np = 1 << (r-1);
+        lst_a((struct block *)cur, r);
+        brank[off] = r;
+        cur = (void *)((size_t)cur + (size_t)np * PAGE_SIZE);
+        off += np;
     }
     return OK;
 }
 
-void *alloc_pages(int rank) {
-    if (!valid_rank(rank)) return (void *)(-EINVAL);
-    
-    int ar = rank;
-    while (ar <= MAX_RANK && !free_lists[ar]) ar++;
+void *alloc_pages(int r) {
+    if (!vr(r)) return (void *)(-EINVAL);
+    int ar = r;
+    while (ar <= MAX_RANK && !flist[ar]) ar++;
     if (ar > MAX_RANK) return (void *)(-ENOSPC);
+    while (ar > r) { spl(ar); ar--; }
     
-    while (ar > rank) {
-        split(ar);
-        ar--;
-    }
+    struct block *b = flist[r];
+    void *ad = (void *)b;
+    lst_r(b, r);
     
-    struct block *b = free_lists[rank];
-    void *addr = (void *)b;
-    lst_rem(b, rank);
-    
-    int idx = pgidx(addr);
-    alloc_arr[idx] = 1;
-    ranks_arr[idx] = rank;
-    
-    return addr;
+    int idx = pgidx(ad);
+    balloc[idx] = 1;
+    brank[idx] = r;
+    return ad;
 }
 
 int return_pages(void *p) {
-    if (!valid_addr(p)) return -EINVAL;
-    
+    if (!va(p)) return -EINVAL;
     int idx = pgidx(p);
-    if (!alloc_arr[idx]) return -EINVAL;
+    if (!balloc[idx]) return -EINVAL;
+    int r = brank[idx];
+    if (!vr(r)) return -EINVAL;
     
-    int rank = ranks_arr[idx];
-    if (!valid_rank(rank)) return -EINVAL;
-    
-    alloc_arr[idx] = 0;
-    lst_add((struct block *)p, rank);
-    coal(p, rank);
-    
+    balloc[idx] = 0;
+    lst_a((struct block *)p, r);
+    coal(p, r);
     return OK;
 }
 
 int query_ranks(void *p) {
-    if (!valid_addr(p)) return -EINVAL;
+    if (!va(p)) return -EINVAL;
     int idx = pgidx(p);
-    return alloc_arr[idx] ? ranks_arr[idx] : get_rank(idx);
+    return balloc[idx] ? brank[idx] : getr(idx);
 }
 
-int query_page_counts(int rank) {
-    if (!valid_rank(rank)) return -EINVAL;
-    if (!free_lists[rank]) return 0;
-    
+int query_page_counts(int r) {
+    if (!vr(r)) return -EINVAL;
+    if (!flist[r]) return 0;
     int cnt = 0;
-    struct block *b = free_lists[rank];
-    struct block *s = b;
-    do {
-        cnt++;
-        b = b->next;
-    } while (b != s);
+    struct block *b = flist[r], *s = b;
+    do { cnt++; b = b->next; } while (b != s);
     return cnt;
 }

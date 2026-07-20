@@ -1,10 +1,6 @@
 #include "buddy.h"
 #include <stddef.h>
 
-/*
- * Buddy Algorithm Implementation
- */
-
 #define PAGE_SIZE 4096
 #define MAX_RANK 16
 #define MIN_RANK 1
@@ -28,6 +24,9 @@ static int total_pages = 0;
 static unsigned char block_ranks[MAX_PAGES];
 static unsigned char block_allocated[MAX_PAGES];
 
+/* Array to quickly find block boundaries - stores the size (in pages) of the free block starting at each page */
+static unsigned short block_sizes[MAX_PAGES];  /* Size in pages, 0 if not a block start */
+
 /* Helper functions */
 static inline int addr_to_page_idx(void *p) {
     return (int)(((size_t)p - (size_t)memory_start) / PAGE_SIZE);
@@ -44,7 +43,7 @@ static inline int is_valid_addr(void *p) {
     return (offset % PAGE_SIZE) == 0;
 }
 
-/* Get buddy address using OFFSET from base, not absolute address */
+/* Get buddy address using OFFSET from base */
 static inline void *get_buddy(void *addr, int rank) {
     size_t block_size = (size_t)PAGE_SIZE << (rank - 1);
     size_t offset = (size_t)addr - (size_t)memory_start;
@@ -52,7 +51,7 @@ static inline void *get_buddy(void *addr, int rank) {
     return (void *)((size_t)memory_start + buddy_offset);
 }
 
-/* Check if block is aligned to its rank size */
+/* Check if block is aligned */
 static inline int is_aligned(void *addr, int rank) {
     size_t block_size = (size_t)PAGE_SIZE << (rank - 1);
     size_t offset = (size_t)addr - (size_t)memory_start;
@@ -93,69 +92,90 @@ static void remove_from_list_safe(block_t *blk, int rank) {
     }
 }
 
-/* Get the rank of a free block containing a specific page index */
+/* Get the rank of a free block containing page_idx using block_sizes array */
 static int get_free_block_rank(int page_idx) {
-    if (block_ranks[page_idx] != 0) {
-        return block_ranks[page_idx];
-    }
+    /* Find the start of the block containing this page */
     int scan = page_idx;
-    while (scan > 0 && block_ranks[scan] == 0) {
+    while (scan > 0 && block_sizes[scan] == 0) {
         scan--;
     }
-    return block_ranks[scan];
-}
-
-/* Coalesce buddy blocks recursively */
-static void coalesce(void *addr, int rank) {
-    if (rank >= MAX_RANK) return;
-    
-    void *buddy = get_buddy(addr, rank);
-    
-    if (buddy < memory_start || buddy >= memory_end) return;
-    
-    int addr_idx = addr_to_page_idx(addr);
-    int buddy_idx = addr_to_page_idx(buddy);
-    
-    /* Check if buddy is free */
-    if (block_allocated[buddy_idx] != 0) return;
-    
-    int buddy_rank = get_free_block_rank(buddy_idx);
-    
-    /* Check if buddy has the same rank */
-    if (buddy_rank != rank) return;
-    
-    /* Determine parent address (lower of the two) */
-    void *parent = (addr < buddy) ? addr : buddy;
-    
-    /* Make sure we can form a valid parent block */
-    if (!is_aligned(parent, rank + 1)) return;
-    
-    /* Both buddies are free with same rank - remove both from free list */
-    remove_from_list_safe((block_t *)buddy, rank);
-    remove_from_list_safe((block_t *)addr, rank);
-    
-    /* Add parent to higher rank free list */
-    add_to_list((block_t *)parent, rank + 1);
-    
-    /* Update tracking */
-    int parent_idx = addr_to_page_idx(parent);
-    block_ranks[parent_idx] = rank + 1;
-    block_allocated[parent_idx] = 0;
-    int parent_pages = 1 << rank;
-    for (int i = 1; i < parent_pages && (parent_idx + i) < MAX_PAGES; i++) {
-        block_ranks[parent_idx + i] = 0;
+    if (block_sizes[scan] == 0) return MIN_RANK;
+    /* Calculate rank from block size in pages */
+    int pages = block_sizes[scan];
+    int rank = 0;
+    while (pages > 0) {
+        pages >>= 1;
+        rank++;
     }
-    
-    /* Recursively coalesce */
-    coalesce(parent, rank + 1);
+    return rank;
 }
 
-/* Split a block of rank into two blocks of rank-1 */
+/* Coalesce buddy blocks */
+static void coalesce(void *addr, int rank) {
+    while (rank < MAX_RANK) {
+        void *buddy = get_buddy(addr, rank);
+        if (buddy < memory_start || buddy >= memory_end) break;
+        
+        int addr_idx = addr_to_page_idx(addr);
+        int buddy_idx = addr_to_page_idx(buddy);
+        
+        /* Check if buddy is free */
+        if (block_allocated[buddy_idx] != 0) break;
+        
+        /* Get buddy's rank using block_sizes */
+        int scan = buddy_idx;
+        while (scan > 0 && block_sizes[scan] == 0) scan--;
+        if (block_sizes[scan] == 0) break;
+        int buddy_pages = block_sizes[scan];
+        int buddy_rank = 0;
+        int tmp = buddy_pages;
+        while (tmp > 0) { tmp >>= 1; buddy_rank++; }
+        
+        if (buddy_rank != rank) break;
+        
+        /* Determine parent address */
+        void *parent = (addr < buddy) ? addr : buddy;
+        if (!is_aligned(parent, rank + 1)) break;
+        
+        int parent_idx = addr_to_page_idx(parent);
+        int parent_pages = 1 << rank;
+        
+        /* Remove both from free list */
+        remove_from_list_safe((block_t *)buddy, rank);
+        remove_from_list_safe((block_t *)addr, rank);
+        
+        /* Add parent to higher rank */
+        add_to_list((block_t *)parent, rank + 1);
+        
+        /* Update tracking */
+        block_ranks[parent_idx] = rank + 1;
+        block_allocated[parent_idx] = 0;
+        if (addr == parent) {
+            block_sizes[parent_idx] = parent_pages * 2;
+            block_sizes[addr_idx] = 0;
+        } else {
+            block_sizes[parent_idx] = parent_pages * 2;
+            block_sizes[buddy_idx] = 0;
+        }
+        /* Clear old block sizes */
+        for (int i = 1; i < parent_pages * 2 && (parent_idx + i) < MAX_PAGES; i++) {
+            if ((parent_idx + i) != addr_idx && (parent_idx + i) != buddy_idx) {
+                block_ranks[parent_idx + i] = 0;
+            }
+        }
+        
+        addr = parent;
+        rank++;
+    }
+}
+
+/* Split a block */
 static void split_block(int rank) {
     if (rank <= MIN_RANK || free_lists[rank] == NULL) return;
     
     block_t *blk = free_lists[rank];
     void *addr = (void *)blk;
+    int idx = addr_to_page_idx(addr);
     
     remove_from_list_safe(blk, rank);
     
@@ -168,13 +188,16 @@ static void split_block(int rank) {
     
     int idx1 = addr_to_page_idx(addr1);
     int idx2 = addr_to_page_idx(addr2);
+    int pages = 1 << (rank - 2);
+    
     block_ranks[idx1] = rank - 1;
     block_ranks[idx2] = rank - 1;
     block_allocated[idx1] = 0;
     block_allocated[idx2] = 0;
+    block_sizes[idx1] = pages;
+    block_sizes[idx2] = pages;
 }
 
-/* Initialize pages */
 int init_page(void *p, int pgcount) {
     if (p == NULL || pgcount <= 0 || pgcount > MAX_PAGES) {
         return -EINVAL;
@@ -184,9 +207,16 @@ int init_page(void *p, int pgcount) {
     total_pages = pgcount;
     memory_end = (void *)((size_t)p + (size_t)pgcount * PAGE_SIZE);
     
-    for (int i = 0; i < MAX_PAGES; i++) {
+    /* Clear tracking arrays */
+    for (int i = 0; i < pgcount; i++) {
         block_ranks[i] = 0;
         block_allocated[i] = 0;
+        block_sizes[i] = 0;
+    }
+    for (int i = pgcount; i < MAX_PAGES; i++) {
+        block_ranks[i] = 0;
+        block_allocated[i] = 0;
+        block_sizes[i] = 0;
     }
     
     for (int i = 0; i <= MAX_RANK; i++) {
@@ -213,8 +243,10 @@ int init_page(void *p, int pgcount) {
         add_to_list((block_t *)current, rank);
         
         block_ranks[page_offset] = rank;
+        block_sizes[page_offset] = pages_in_block;
         for (int i = 1; i < pages_in_block; i++) {
             block_ranks[page_offset + i] = 0;
+            block_sizes[page_offset + i] = 0;
         }
         
         current = (void *)((size_t)current + ((size_t)PAGE_SIZE << (rank - 1)));
@@ -224,7 +256,6 @@ int init_page(void *p, int pgcount) {
     return OK;
 }
 
-/* Allocate pages with specified rank */
 void *alloc_pages(int rank) {
     if (!is_valid_rank(rank)) {
         return (void *)(-EINVAL);
@@ -250,9 +281,11 @@ void *alloc_pages(int rank) {
     remove_from_list_safe(blk, rank);
     
     int idx = addr_to_page_idx(addr);
+    int pages = 1 << (rank - 1);
+    
     block_allocated[idx] = 1;
     block_ranks[idx] = rank;
-    int pages = 1 << (rank - 1);
+    block_sizes[idx] = 0;  /* Not a free block anymore */
     for (int i = 1; i < pages && (idx + i) < MAX_PAGES; i++) {
         block_ranks[idx + i] = 0;
     }
@@ -260,7 +293,6 @@ void *alloc_pages(int rank) {
     return addr;
 }
 
-/* Return pages to the buddy system */
 int return_pages(void *p) {
     if (!is_valid_addr(p)) {
         return -EINVAL;
@@ -273,12 +305,14 @@ int return_pages(void *p) {
     }
     
     int rank = block_ranks[idx];
-    
     if (!is_valid_rank(rank)) {
         return -EINVAL;
     }
     
+    int pages = 1 << (rank - 1);
+    
     block_allocated[idx] = 0;
+    block_sizes[idx] = pages;
     
     add_to_list((block_t *)p, rank);
     
@@ -287,7 +321,6 @@ int return_pages(void *p) {
     return OK;
 }
 
-/* Query rank of a page */
 int query_ranks(void *p) {
     if (!is_valid_addr(p)) {
         return -EINVAL;
@@ -302,7 +335,6 @@ int query_ranks(void *p) {
     }
 }
 
-/* Query count of free pages for a rank */
 int query_page_counts(int rank) {
     if (!is_valid_rank(rank)) {
         return -EINVAL;

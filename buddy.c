@@ -4,316 +4,215 @@
 #define PAGE_SIZE 4096
 #define MAX_RANK 16
 #define MIN_RANK 1
-#define MAX_PAGES (256 * 1024)  /* Increased max pages */
+#define MAX_PAGES (200000)
 
-/* Node in the free list for each rank */
-typedef struct block {
+static struct block {
     struct block *next;
     struct block *prev;
-} block_t;
+} *free_lists[MAX_RANK + 1];
 
-/* Free list for each rank (1-16) */
-static block_t *free_lists[MAX_RANK + 1];
+static void *mem_start = NULL;
+static void *mem_end = NULL;
+static int num_pages = 0;
 
-/* Memory region info */
-static void *memory_start = NULL;
-static int total_pages = 0;
+/* Tracking */
+static unsigned char ranks_arr[MAX_PAGES];
+static unsigned char alloc_arr[MAX_PAGES];
 
-/* Tracking arrays - use static initialization */
-static unsigned char block_ranks[MAX_PAGES];
-static unsigned char block_allocated[MAX_PAGES];
-
-/* Helper: Get page index from address */
-static inline int addr_to_page_idx(void *p) {
-    size_t offset = (size_t)p - (size_t)memory_start;
-    return (int)(offset / PAGE_SIZE);
+static inline int pgidx(void *p) {
+    return (int)(((size_t)p - (size_t)mem_start) / PAGE_SIZE);
 }
 
-static inline int is_valid_rank(int rank) {
-    return (rank >= MIN_RANK && rank <= MAX_RANK);
+static inline void *buddyof(void *addr, int rank) {
+    size_t sz = (size_t)PAGE_SIZE << (rank - 1);
+    size_t off = (size_t)addr - (size_t)mem_start;
+    return (void *)((size_t)mem_start + (off ^ sz));
 }
 
-static inline int is_valid_addr(void *p) {
-    if (p == NULL) return 0;
-    int idx = addr_to_page_idx(p);
-    return (idx >= 0 && idx < total_pages);
+static inline int aligned(void *addr, int rank) {
+    size_t sz = (size_t)PAGE_SIZE << (rank - 1);
+    return (((size_t)addr - (size_t)mem_start) & (sz - 1)) == 0;
 }
 
-/* Get buddy address using OFFSET from base */
-static inline void *get_buddy(void *addr, int rank) {
-    size_t block_size = (size_t)PAGE_SIZE << (rank - 1);
-    size_t offset = (size_t)addr - (size_t)memory_start;
-    size_t buddy_offset = offset ^ block_size;
-    return (void *)((size_t)memory_start + buddy_offset);
+static inline int valid_rank(int r) {
+    return r >= MIN_RANK && r <= MAX_RANK;
 }
 
-/* Check if block is aligned */
-static inline int is_aligned(void *addr, int rank) {
-    size_t block_size = (size_t)PAGE_SIZE << (rank - 1);
-    size_t offset = (size_t)addr - (size_t)memory_start;
-    return (offset % block_size) == 0;
+static inline int valid_addr(void *p) {
+    if (!p) return 0;
+    if (p < mem_start || p >= mem_end) return 0;
+    return (((size_t)p - (size_t)mem_start) & (PAGE_SIZE - 1)) == 0;
 }
 
-/* List operations */
-static void init_block_list(block_t *blk) {
-    blk->next = blk;
-    blk->prev = blk;
+static void lst_init(struct block *b) {
+    b->next = b->prev = b;
 }
 
-static void remove_from_list(block_t *blk) {
-    blk->prev->next = blk->next;
-    blk->next->prev = blk->prev;
-}
-
-static void add_to_list(block_t *blk, int rank) {
-    if (free_lists[rank] == NULL) {
-        init_block_list(blk);
-        free_lists[rank] = blk;
+static void lst_add(struct block *b, int rank) {
+    if (!free_lists[rank]) {
+        lst_init(b);
+        free_lists[rank] = b;
     } else {
-        blk->next = free_lists[rank];
-        blk->prev = free_lists[rank]->prev;
-        free_lists[rank]->prev->next = blk;
-        free_lists[rank]->prev = blk;
+        struct block *h = free_lists[rank];
+        b->next = h;
+        b->prev = h->prev;
+        h->prev->next = b;
+        h->prev = b;
     }
 }
 
-static void remove_from_list_safe(block_t *blk, int rank) {
-    if (blk->next == blk) {
-        free_lists[rank] = NULL;
+static void lst_rem(struct block *b, int rank) {
+    if (b->next == b) {
+        free_lists[rank] = 0;
     } else {
-        remove_from_list(blk);
-        if (free_lists[rank] == blk) {
-            free_lists[rank] = blk->next;
-        }
+        b->prev->next = b->next;
+        b->next->prev = b->prev;
+        if (free_lists[rank] == b) free_lists[rank] = b->next;
     }
 }
 
-/* Get the rank of a free block - backward scan */
-static int get_free_block_rank(int page_idx) {
-    int scan = page_idx;
-    while (scan > 0 && block_ranks[scan] == 0) {
-        scan--;
-    }
-    return block_ranks[scan];
+static int get_rank(int idx) {
+    while (idx > 0 && !ranks_arr[idx]) idx--;
+    return ranks_arr[idx];
 }
 
-/* Coalesce buddy blocks - iterative instead of recursive */
-static void coalesce(void *addr, int rank) {
+static void coal(void *addr, int rank) {
     while (rank < MAX_RANK) {
-        void *buddy = get_buddy(addr, rank);
+        void *bud = buddyof(addr, rank);
+        if (!valid_addr(bud)) break;
         
-        /* Check if buddy is valid */
-        if (!is_valid_addr(buddy)) break;
+        int aidx = pgidx(addr);
+        int bidx = pgidx(bud);
+        if (bidx < 0 || bidx >= num_pages) break;
         
-        int addr_idx = addr_to_page_idx(addr);
-        int buddy_idx = addr_to_page_idx(buddy);
+        if (alloc_arr[bidx]) break;
+        if (get_rank(bidx) != rank) break;
         
-        /* Bounds check */
-        if (buddy_idx < 0 || buddy_idx >= total_pages) break;
+        void *par = (addr < bud) ? addr : bud;
+        if (!aligned(par, rank + 1)) break;
         
-        /* Check if buddy is free */
-        if (block_allocated[buddy_idx] != 0) break;
+        lst_rem((struct block *)bud, rank);
+        lst_rem((struct block *)addr, rank);
+        lst_add((struct block *)par, rank + 1);
         
-        /* Get buddy's rank */
-        int buddy_rank = get_free_block_rank(buddy_idx);
-        if (buddy_rank != rank) break;
+        int pidx = pgidx(par);
+        ranks_arr[pidx] = rank + 1;
+        alloc_arr[pidx] = 0;
         
-        /* Determine parent address */
-        void *parent = (addr < buddy) ? addr : buddy;
-        if (!is_aligned(parent, rank + 1)) break;
+        int n = 1 << rank;
+        int lim = pidx + n + n;
+        if (lim > num_pages) lim = num_pages;
+        for (int i = pidx + 1; i < lim; i++) ranks_arr[i] = 0;
         
-        /* Remove both from free list */
-        remove_from_list_safe((block_t *)buddy, rank);
-        remove_from_list_safe((block_t *)addr, rank);
-        
-        /* Add parent to higher rank */
-        add_to_list((block_t *)parent, rank + 1);
-        
-        /* Update tracking */
-        int parent_idx = addr_to_page_idx(parent);
-        block_ranks[parent_idx] = rank + 1;
-        block_allocated[parent_idx] = 0;
-        
-        /* Clear block_ranks for all pages in parent except first */
-        int parent_pages = 1 << rank;
-        int start_clear = parent_idx + 1;
-        int end_clear = parent_idx + parent_pages + parent_pages;
-        if (end_clear > total_pages) end_clear = total_pages;
-        for (int i = start_clear; i < end_clear; i++) {
-            block_ranks[i] = 0;
-        }
-        
-        addr = parent;
+        addr = par;
         rank++;
     }
 }
 
-/* Split a block of rank into two blocks of rank-1 */
-static void split_block(int rank) {
-    if (rank <= MIN_RANK) return;
-    if (free_lists[rank] == NULL) return;
+static void split(int rank) {
+    if (rank <= MIN_RANK || !free_lists[rank]) return;
+    struct block *b = free_lists[rank];
+    void *addr = (void *)b;
+    lst_rem(b, rank);
     
-    block_t *blk = free_lists[rank];
-    void *addr = (void *)blk;
+    size_t ss = (size_t)PAGE_SIZE << (rank - 2);
+    void *a1 = addr;
+    void *a2 = (void *)((size_t)addr + ss);
     
-    remove_from_list_safe(blk, rank);
+    lst_add((struct block *)a1, rank - 1);
+    lst_add((struct block *)a2, rank - 1);
     
-    size_t smaller_size = (size_t)PAGE_SIZE << (rank - 2);
-    void *addr1 = addr;
-    void *addr2 = (void *)((size_t)addr + smaller_size);
-    
-    add_to_list((block_t *)addr1, rank - 1);
-    add_to_list((block_t *)addr2, rank - 1);
-    
-    int idx1 = addr_to_page_idx(addr1);
-    int idx2 = addr_to_page_idx(addr2);
-    
-    block_ranks[idx1] = rank - 1;
-    block_ranks[idx2] = rank - 1;
-    block_allocated[idx1] = 0;
-    block_allocated[idx2] = 0;
+    int i1 = pgidx(a1), i2 = pgidx(a2);
+    ranks_arr[i1] = ranks_arr[i2] = rank - 1;
+    alloc_arr[i1] = alloc_arr[i2] = 0;
 }
 
 int init_page(void *p, int pgcount) {
-    if (p == NULL || pgcount <= 0) {
-        return -EINVAL;
-    }
-    if (pgcount > MAX_PAGES) {
-        return -EINVAL;
-    }
+    if (!p || pgcount <= 0 || pgcount > MAX_PAGES) return -EINVAL;
     
-    memory_start = p;
-    total_pages = pgcount;
+    mem_start = p;
+    num_pages = pgcount;
+    mem_end = (void *)((size_t)p + (size_t)pgcount * PAGE_SIZE);
     
-    /* Clear tracking arrays - only up to pgcount */
     for (int i = 0; i < pgcount; i++) {
-        block_ranks[i] = 0;
-        block_allocated[i] = 0;
+        ranks_arr[i] = alloc_arr[i] = 0;
     }
+    for (int i = 0; i <= MAX_RANK; i++) free_lists[i] = 0;
     
-    for (int i = 0; i <= MAX_RANK; i++) {
-        free_lists[i] = NULL;
-    }
-    
-    void *current = p;
-    int page_offset = 0;
-    
-    while (page_offset < pgcount) {
-        int remaining = pgcount - page_offset;
-        
-        /* Find the largest rank block that fits and is properly aligned */
+    void *cur = p;
+    int off = 0;
+    while (off < pgcount) {
+        int rem = pgcount - off;
         int rank = MAX_RANK;
         while (rank > MIN_RANK) {
-            int pages_needed = 1 << (rank - 1);
-            if (pages_needed <= remaining && is_aligned(current, rank)) {
-                break;
-            }
+            int need = 1 << (rank - 1);
+            if (need <= rem && aligned(cur, rank)) break;
             rank--;
         }
-        
-        int pages_in_block = 1 << (rank - 1);
-        
-        add_to_list((block_t *)current, rank);
-        
-        block_ranks[page_offset] = rank;
-        
-        current = (void *)((size_t)current + ((size_t)PAGE_SIZE << (rank - 1)));
-        page_offset += pages_in_block;
+        int npg = 1 << (rank - 1);
+        lst_add((struct block *)cur, rank);
+        ranks_arr[off] = rank;
+        cur = (void *)((size_t)cur + (size_t)npg * PAGE_SIZE);
+        off += npg;
     }
-    
     return OK;
 }
 
 void *alloc_pages(int rank) {
-    if (!is_valid_rank(rank)) {
-        return (void *)(-EINVAL);
+    if (!valid_rank(rank)) return (void *)(-EINVAL);
+    
+    int ar = rank;
+    while (ar <= MAX_RANK && !free_lists[ar]) ar++;
+    if (ar > MAX_RANK) return (void *)(-ENOSPC);
+    
+    while (ar > rank) {
+        split(ar);
+        ar--;
     }
     
-    /* Find the smallest available block >= requested rank */
-    int alloc_rank = rank;
-    while (alloc_rank <= MAX_RANK && free_lists[alloc_rank] == NULL) {
-        alloc_rank++;
-    }
+    struct block *b = free_lists[rank];
+    void *addr = (void *)b;
+    lst_rem(b, rank);
     
-    if (alloc_rank > MAX_RANK) {
-        return (void *)(-ENOSPC);
-    }
-    
-    /* Split down to desired rank */
-    while (alloc_rank > rank) {
-        split_block(alloc_rank);
-        alloc_rank--;
-    }
-    
-    block_t *blk = free_lists[rank];
-    void *addr = (void *)blk;
-    
-    remove_from_list_safe(blk, rank);
-    
-    int idx = addr_to_page_idx(addr);
-    int pages = 1 << (rank - 1);
-    
-    block_allocated[idx] = 1;
-    block_ranks[idx] = rank;
+    int idx = pgidx(addr);
+    alloc_arr[idx] = 1;
+    ranks_arr[idx] = rank;
     
     return addr;
 }
 
 int return_pages(void *p) {
-    if (!is_valid_addr(p)) {
-        return -EINVAL;
-    }
+    if (!valid_addr(p)) return -EINVAL;
     
-    int idx = addr_to_page_idx(p);
+    int idx = pgidx(p);
+    if (!alloc_arr[idx]) return -EINVAL;
     
-    if (block_allocated[idx] == 0) {
-        return -EINVAL;
-    }
+    int rank = ranks_arr[idx];
+    if (!valid_rank(rank)) return -EINVAL;
     
-    int rank = block_ranks[idx];
-    if (!is_valid_rank(rank)) {
-        return -EINVAL;
-    }
-    
-    block_allocated[idx] = 0;
-    
-    add_to_list((block_t *)p, rank);
-    
-    coalesce(p, rank);
+    alloc_arr[idx] = 0;
+    lst_add((struct block *)p, rank);
+    coal(p, rank);
     
     return OK;
 }
 
 int query_ranks(void *p) {
-    if (!is_valid_addr(p)) {
-        return -EINVAL;
-    }
-    
-    int idx = addr_to_page_idx(p);
-    
-    if (block_allocated[idx]) {
-        return block_ranks[idx];
-    } else {
-        return get_free_block_rank(idx);
-    }
+    if (!valid_addr(p)) return -EINVAL;
+    int idx = pgidx(p);
+    return alloc_arr[idx] ? ranks_arr[idx] : get_rank(idx);
 }
 
 int query_page_counts(int rank) {
-    if (!is_valid_rank(rank)) {
-        return -EINVAL;
-    }
+    if (!valid_rank(rank)) return -EINVAL;
+    if (!free_lists[rank]) return 0;
     
-    if (free_lists[rank] == NULL) {
-        return 0;
-    }
-    
-    int count = 0;
-    block_t *blk = free_lists[rank];
-    block_t *start = blk;
+    int cnt = 0;
+    struct block *b = free_lists[rank];
+    struct block *s = b;
     do {
-        count++;
-        blk = blk->next;
-    } while (blk != start);
-    
-    return count;
+        cnt++;
+        b = b->next;
+    } while (b != s);
+    return cnt;
 }

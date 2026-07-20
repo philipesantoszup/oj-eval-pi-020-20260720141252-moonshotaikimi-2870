@@ -4,7 +4,6 @@
 #define PAGE_SIZE 4096
 #define MAX_RANK 16
 #define MIN_RANK 1
-/* Increased to handle up to 1 million pages ~ 4GB */
 #define MAX_TRACK (1024 * 1024)
 
 static struct block {
@@ -13,12 +12,13 @@ static struct block {
 
 static void *mstart = NULL;
 static int npages = 0;
-/* Static arrays for tracking - placed in BSS section */
 static unsigned char brank[MAX_TRACK];
 static unsigned char balloc[MAX_TRACK];
 
 static inline int pgidx(void *p) {
-    return (int)(((size_t)p - (size_t)mstart) / PAGE_SIZE);
+    int idx = (int)(((size_t)p - (size_t)mstart) / PAGE_SIZE);
+    if (idx < 0 || idx >= npages) return -1;
+    return idx;
 }
 
 static inline void *buddy(void *a, int r) {
@@ -37,7 +37,13 @@ static inline int vr(int r) { return r >= MIN_RANK && r <= MAX_RANK; }
 static inline int va(void *p) {
     if (!p) return 0;
     int idx = pgidx(p);
-    return idx >= 0 && idx < npages;
+    return idx >= 0;
+}
+
+static inline int vaw(void *p) {
+    if (!p) return 0;
+    int idx = pgidx(p);
+    return idx >= 0 && idx < MAX_TRACK;
 }
 
 static void lst_i(struct block *b) { b->next = b->prev = b; }
@@ -61,8 +67,9 @@ static void lst_r(struct block *b, int r) {
 }
 
 static int getr(int i) {
+    if (i < 0 || i >= npages) return MIN_RANK;
     while (i > 0 && !brank[i]) i--;
-    return brank[i];
+    return brank[i] ? brank[i] : MIN_RANK;
 }
 
 static void coal(void *a, int r) {
@@ -70,6 +77,9 @@ static void coal(void *a, int r) {
         void *b = buddy(a, r);
         if (!va(b)) break;
         int bi = pgidx(b);
+        int ai = pgidx(a);
+        if (bi < 0 || bi >= npages) break;
+        if (ai < 0 || ai >= npages) break;
         if (balloc[bi]) break;
         if (getr(bi) != r) break;
         void *p = (a < b) ? a : b;
@@ -80,6 +90,7 @@ static void coal(void *a, int r) {
         lst_a((struct block *)p, r+1);
         
         int pi = pgidx(p);
+        if (pi < 0 || pi >= npages) break;
         brank[pi] = r+1; 
         balloc[pi] = 0;
         int n = 1 << (r+1);
@@ -102,8 +113,8 @@ static void spl(int r) {
     lst_a((struct block *)a2, r-1);
     
     int i1 = pgidx(a1), i2 = pgidx(a2);
-    brank[i1] = brank[i2] = r-1;
-    balloc[i1] = balloc[i2] = 0;
+    if (i1 >= 0 && i1 < npages) { brank[i1] = r-1; balloc[i1] = 0; }
+    if (i2 >= 0 && i2 < npages) { brank[i2] = r-1; balloc[i2] = 0; }
 }
 
 int init_page(void *p, int pc) {
@@ -112,7 +123,7 @@ int init_page(void *p, int pc) {
     mstart = p;
     npages = pc;
     
-    for (int i = 0; i < pc; i++) { brank[i] = 0; balloc[i] = 0; }
+    for (int i = 0; i < pc && i < MAX_TRACK; i++) { brank[i] = 0; balloc[i] = 0; }
     for (int i = 0; i <= MAX_RANK; i++) flist[i] = NULL;
     
     void *cur = p;
@@ -127,7 +138,7 @@ int init_page(void *p, int pc) {
         }
         int np = 1 << (r-1);
         lst_a((struct block *)cur, r);
-        brank[off] = r;
+        if (off >= 0 && off < MAX_TRACK) brank[off] = r;
         cur = (void *)((size_t)cur + (size_t)np * PAGE_SIZE);
         off += np;
     }
@@ -146,14 +157,17 @@ void *alloc_pages(int r) {
     lst_r(b, r);
     
     int idx = pgidx(ad);
-    balloc[idx] = 1;
-    brank[idx] = r;
+    if (idx >= 0 && idx < MAX_TRACK) {
+        balloc[idx] = 1;
+        brank[idx] = r;
+    }
     return ad;
 }
 
 int return_pages(void *p) {
     if (!va(p)) return -EINVAL;
     int idx = pgidx(p);
+    if (idx < 0 || idx >= npages) return -EINVAL;
     if (!balloc[idx]) return -EINVAL;
     int r = brank[idx];
     if (!vr(r)) return -EINVAL;
@@ -167,6 +181,7 @@ int return_pages(void *p) {
 int query_ranks(void *p) {
     if (!va(p)) return -EINVAL;
     int idx = pgidx(p);
+    if (idx < 0 || idx >= npages) return -EINVAL;
     return balloc[idx] ? brank[idx] : getr(idx);
 }
 

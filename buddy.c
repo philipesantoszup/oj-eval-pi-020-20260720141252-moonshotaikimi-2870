@@ -4,7 +4,8 @@
 #define PAGE_SIZE 4096
 #define MAX_RANK 16
 #define MIN_RANK 1
-#define MAX_TRACK (128 * 1024)
+/* Increased to handle up to 1 million pages ~ 4GB */
+#define MAX_TRACK (1024 * 1024)
 
 static struct block {
     struct block *next, *prev;
@@ -12,6 +13,7 @@ static struct block {
 
 static void *mstart = NULL;
 static int npages = 0;
+/* Static arrays for tracking - placed in BSS section */
 static unsigned char brank[MAX_TRACK];
 static unsigned char balloc[MAX_TRACK];
 
@@ -51,7 +53,9 @@ static void lst_a(struct block *b, int r) {
 
 static void lst_r(struct block *b, int r) {
     if (b->next == b) flist[r] = NULL;
-    else { b->prev->next = b->next; b->next->prev = b->prev;
+    else { 
+        b->prev->next = b->next; 
+        b->next->prev = b->prev;
         if (flist[r] == b) flist[r] = b->next;
     }
 }
@@ -65,7 +69,7 @@ static void coal(void *a, int r) {
     while (r < MAX_RANK) {
         void *b = buddy(a, r);
         if (!va(b)) break;
-        int bi = pgidx(b), ai = pgidx(a);
+        int bi = pgidx(b);
         if (balloc[bi]) break;
         if (getr(bi) != r) break;
         void *p = (a < b) ? a : b;
@@ -76,7 +80,8 @@ static void coal(void *a, int r) {
         lst_a((struct block *)p, r+1);
         
         int pi = pgidx(p);
-        brank[pi] = r+1; balloc[pi] = 0;
+        brank[pi] = r+1; 
+        balloc[pi] = 0;
         int n = 1 << (r+1);
         if (pi + n > npages) n = npages - pi;
         for (int i = 1; i < n && pi + i < npages; i++) brank[pi+i] = 0;
@@ -102,7 +107,8 @@ static void spl(int r) {
 }
 
 int init_page(void *p, int pc) {
-    if (!p || pc <= 0 || pc > MAX_TRACK) return -EINVAL;
+    if (!p || pc <= 0) return -EINVAL;
+    if (pc > MAX_TRACK) return -EINVAL;
     mstart = p;
     npages = pc;
     
